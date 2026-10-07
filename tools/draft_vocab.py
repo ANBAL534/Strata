@@ -3,22 +3,21 @@
 The engine reads rt/draft_vocab.bin (int32 token ids) when the draft layer binds and computes the draft logits over
 those rows only: a smaller head is faster and takes less VRAM, but a token outside the subset can never be drafted.
 The shipped subset was built from English and code and had 27 of the vocabulary's 55,328 Han tokens, so an answer in
-Chinese drafted almost nothing (#137).  This adds whole scripts to a subset or builds a Latin-only draft subset:
+Chinese drafted almost nothing (#137).  This adds whole scripts or corpus-selected tokens to a subset. The Latin
+subset uses the same `--add` selection as other scripts:
 
-    python tools/draft_vocab.py --gguf <model>-00001-of-0000N.gguf --base data/draft_vocab.bin --add cjk \
-        --out data/draft_vocab.bin
-    python tools/draft_vocab.py --gguf <model>-00001-of-0000N.gguf --base data/draft_vocab_en.bin \
-        --latin --out data/draft_vocab_latin.bin
+    python tools/draft_vocab.py --gguf <model>-00001-of-0000N.gguf --base data/draft_vocab.bin --add cjk --out data/draft_vocab.bin
+    python tools/draft_vocab.py --gguf <model>-00001-of-0000N.gguf --base data/draft_vocab_en.bin --add latin --out data/draft_vocab_latin.bin
 
---add takes han, kana, hangul, cjk_punct, cjk (those four) or cyrillic.  The base ids keep their order; the added ones follow in
-id order.  --stats prints what a subset holds.
+--add takes han, kana, hangul, cjk_punct, cjk (those four), cyrillic or latin. For latin, it keeps the English/code
+base's UTF-8 fallback pieces, filters out dedicated tokens of other scripts, and adds all non-ASCII Latin tokens. The
+base ids keep their order; the added ones follow in id order. --stats prints what a subset holds.
 
 A language written in a script the base already holds (French, Spanish, German... in Latin letters) needs specific
 words and word pieces, not a whole script.  --corpus adds the tokens of a text corpus in that language: the most
 frequent ones that together cover --coverage (default 0.99) of the corpus's token occurrences (#597):
 
-    python tools/draft_vocab.py --gguf <model>-00001-of-0000N.gguf --base data/draft_vocab_en.bin \
-        --corpus fr1.txt fr2.txt ... --coverage 0.99 --out data/draft_vocab_fr.bin
+    python tools/draft_vocab.py --gguf <model>-00001-of-0000N.gguf --base data/draft_vocab_en.bin --corpus fr1.txt fr2.txt ... --coverage 0.99 --out data/draft_vocab_fr.bin
 
 It prints the share of the corpus's occurrences outside the base and outside the new subset.  --add and --corpus
 can be combined.
@@ -43,14 +42,20 @@ SCRIPTS = {
     "cjk_punct": [(0x3000, 0x303F), (0xFF00, 0xFF65), (0xFFA0, 0xFFEF)],
     # Ukrainian, Russian, Bulgarian, Serbian...: the shipped subset held 142 of the vocabulary's 18,580 Cyrillic tokens
     "cyrillic": [(0x0400, 0x04FF), (0x0500, 0x052F), (0x1C80, 0x1C8F), (0x2DE0, 0x2DFF), (0xA640, 0xA69F)],
+    # Unicode's Latin script is not a single set of blocks; use the Unicode property regex below.
+    "latin": [],
 }
 GROUPS = {"cjk": ["han", "kana", "hangul", "cjk_punct"]}
 LATIN_OR_NEUTRAL = regex.compile(r"[\p{Script=Latin}\p{Script=Common}\p{Script=Inherited}]*\Z")
 LATIN_NON_ASCII = regex.compile(r"[\p{Script=Latin}&&[^\x00-\x7f]]", regex.V1)
+LATIN_SCRIPT = regex.compile(r"\p{Script=Latin}")
+LATIN_COMBINING_MARK = regex.compile(r"[\p{Script=Inherited}&&\p{M}]", regex.V1)
 
 
 def scripts_of(text: str) -> set[str]:
     found = set()
+    if LATIN_SCRIPT.search(text):
+        found.add("latin")
     for ch in text:
         c = ord(ch)
         for name, ranges in SCRIPTS.items():
@@ -101,25 +106,40 @@ def latin_subset(tok, base: list[int]) -> list[int]:
     produce any language: this file limits only the draft layer's direct token proposals.
     """
     def allowed(t: str) -> bool:
-        return LATIN_OR_NEUTRAL.fullmatch(t) is not None and not scripts_of(t)
+        return LATIN_OR_NEUTRAL.fullmatch(t) is not None and not (scripts_of(t) - {"latin"})
 
     kept = [i for i in base if (t := token_text(tok, i)) is None or allowed(t)]
     have = set(kept)
     return kept + [i for i in range(len(tok.tokens))
                    if i not in have and (t := token_text(tok, i)) is not None
-                   and allowed(t) and LATIN_NON_ASCII.search(t) is not None]
+                   and allowed(t) and LATIN_SCRIPT.search(t) is not None
+                   and (LATIN_NON_ASCII.search(t) is not None or LATIN_COMBINING_MARK.search(t) is not None)]
+
+
+def select_ids(tok, base: list[int], want: set[str], from_corpus=(), kinds=None) -> list[int]:
+    """Build the chosen subset while keeping base ids first and new ids in vocabulary order."""
+    if "latin" in want:
+        if len(want) != 1 or from_corpus:
+            raise ValueError("--add latin cannot be combined with another --add script or --corpus")
+        if not base:
+            raise ValueError("--add latin needs --base data/draft_vocab_en.bin")
+        return latin_subset(tok, base)
+    have = set(base)
+    if kinds is None:
+        kinds = [scripts_of(t) if (t := token_text(tok, i)) is not None else set()
+                 for i in range(len(tok.tokens))]
+    corpus_ids = set(from_corpus)
+    return base + [i for i, found in enumerate(kinds) if i not in have and (found & want or i in corpus_ids)]
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--gguf", required=True, help="the model's (first) GGUF file: its vocabulary")
     ap.add_argument("--base", help="the subset to extend (int32 ids)")
-    ap.add_argument("--add", default="", help="comma list: han, kana, hangul, cjk_punct, cjk, cyrillic")
+    ap.add_argument("--add", default="", help="comma list: han, kana, hangul, cjk_punct, cjk, cyrillic, latin")
     ap.add_argument("--corpus", nargs="+", default=[], help="UTF-8 text files in the language to add (#597)")
     ap.add_argument("--coverage", type=float, default=0.99,
                     help="with --corpus: the share of its token occurrences the added tokens cover (default 0.99)")
-    ap.add_argument("--latin", action="store_true",
-                    help="filter the base to Latin script and add accented Latin tokens (no CJK/Cyrillic)")
     ap.add_argument("--out", help="where to write the new subset")
     ap.add_argument("--stats", action="store_true", help="print what the base (and the new) subset holds")
     a = ap.parse_args()
@@ -142,12 +162,12 @@ def main() -> int:
     counts = corpus_counts(tok, a.corpus) if a.corpus else Counter()
     from_corpus = set(covering(counts, a.coverage)) if counts else set()
     have = set(base)
-    if a.latin and (a.add or a.corpus):
-        sys.exit("--latin cannot be combined with --add or --corpus")
-    if a.latin and not a.base:
-        sys.exit("--latin needs --base data/draft_vocab_en.bin")
+    if "latin" in want and not base:
+        sys.exit("--add latin needs --base data/draft_vocab_en.bin")
+    if "latin" in want and (len(want) != 1 or a.corpus):
+        sys.exit("--add latin cannot be combined with another --add script or --corpus")
     added = [i for i in range(n) if i not in have and (kinds[i] & want or i in from_corpus)]
-    ids = latin_subset(tok, base) if a.latin else base + added
+    ids = select_ids(tok, base, want, from_corpus, kinds)
 
     def stats(label, sel):
         counts = {nm: sum(1 for i in sel if nm in kinds[i]) for nm in SCRIPTS}
@@ -157,7 +177,7 @@ def main() -> int:
     if a.stats or not a.out:
         if base:
             stats("base", base)
-        if added or a.latin:
+        if added or "latin" in want:
             stats("new", ids)
     if counts:
         print(f"corpus: {sum(counts.values())} token occurrences, {len(counts)} distinct; "

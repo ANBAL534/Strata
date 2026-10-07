@@ -138,9 +138,10 @@ English/code subset, 0.7% are outside this one. Drafts accepted in French answer
 8 prompts x 2 passes; English 0.61 -> 0.63 and code 0.77 -> 0.78, no loss), and 141 -> 158 tok/s in French on an
 RTX 5090 (IQ3_S, the reporter's measurement).
 `--draft-vocab latin` takes the English/code subset, removes dedicated non-Latin script tokens, and adds accented
-Latin tokens for Spanish, French, German and other Latin-script languages (54,262 ids in this vocabulary). It does
-not restrict the main model's output language: only the MTP draft head uses this subset. Byte fragments stay for
-UTF-8 fallback.
+Latin tokens for Spanish, French, German and other Latin-script languages (54,262 ids in this vocabulary). The
+shipped subset is built with the same `tools/draft_vocab.py --add` selector used for other scripts. It does not
+restrict the main model's output language: only the MTP draft head uses this subset. Byte fragments stay for UTF-8
+fallback.
 `tools/draft_vocab.py` builds and inspects subsets. When the start stops with "the draft head does not fit" (a
 12 GB card with a long context, #474), the engine says how much the head needs, how much VRAM is free and which
 smaller subset fits, and the server's start error repeats it; setup suggests `--draft-vocab en` on cards under
