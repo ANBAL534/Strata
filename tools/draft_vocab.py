@@ -3,10 +3,12 @@
 The engine reads rt/draft_vocab.bin (int32 token ids) when the draft layer binds and computes the draft logits over
 those rows only: a smaller head is faster and takes less VRAM, but a token outside the subset can never be drafted.
 The shipped subset was built from English and code and had 27 of the vocabulary's 55,328 Han tokens, so an answer in
-Chinese drafted almost nothing (#137).  This adds whole scripts to a subset:
+Chinese drafted almost nothing (#137).  This adds whole scripts to a subset or builds a Latin-only draft subset:
 
     python tools/draft_vocab.py --gguf <model>-00001-of-0000N.gguf --base data/draft_vocab.bin --add cjk \
         --out data/draft_vocab.bin
+    python tools/draft_vocab.py --gguf <model>-00001-of-0000N.gguf --base data/draft_vocab_en.bin \
+        --latin --out data/draft_vocab_latin.bin
 
 --add takes han, kana, hangul, cjk_punct, cjk (those four) or cyrillic.  The base ids keep their order; the added ones follow in
 id order.  --stats prints what a subset holds.
@@ -29,6 +31,8 @@ from array import array
 from collections import Counter
 from pathlib import Path
 
+import regex
+
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import strata_tokenizer as ST  # noqa: E402
 
@@ -41,6 +45,8 @@ SCRIPTS = {
     "cyrillic": [(0x0400, 0x04FF), (0x0500, 0x052F), (0x1C80, 0x1C8F), (0x2DE0, 0x2DFF), (0xA640, 0xA69F)],
 }
 GROUPS = {"cjk": ["han", "kana", "hangul", "cjk_punct"]}
+LATIN_OR_NEUTRAL = regex.compile(r"[\p{Script=Latin}\p{Script=Common}\p{Script=Inherited}]*\Z")
+LATIN_NON_ASCII = regex.compile(r"[\p{Script=Latin}&&[^\x00-\x7f]]", regex.V1)
 
 
 def scripts_of(text: str) -> set[str]:
@@ -88,6 +94,22 @@ def outside(counts: Counter, ids) -> float:
     return sum(c for i, c in counts.items() if i not in have) / total if total else 0.0
 
 
+def latin_subset(tok, base: list[int]) -> list[int]:
+    """English/code base plus Latin letters with accents; no dedicated tokens for other scripts.
+
+    Keep byte fragments from the base so ordinary UTF-8 fallback still works. The main model can still
+    produce any language: this file limits only the draft layer's direct token proposals.
+    """
+    def allowed(t: str) -> bool:
+        return LATIN_OR_NEUTRAL.fullmatch(t) is not None and not scripts_of(t)
+
+    kept = [i for i in base if (t := token_text(tok, i)) is None or allowed(t)]
+    have = set(kept)
+    return kept + [i for i in range(len(tok.tokens))
+                   if i not in have and (t := token_text(tok, i)) is not None
+                   and allowed(t) and LATIN_NON_ASCII.search(t) is not None]
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--gguf", required=True, help="the model's (first) GGUF file: its vocabulary")
@@ -96,6 +118,8 @@ def main() -> int:
     ap.add_argument("--corpus", nargs="+", default=[], help="UTF-8 text files in the language to add (#597)")
     ap.add_argument("--coverage", type=float, default=0.99,
                     help="with --corpus: the share of its token occurrences the added tokens cover (default 0.99)")
+    ap.add_argument("--latin", action="store_true",
+                    help="filter the base to Latin script and add accented Latin tokens (no CJK/Cyrillic)")
     ap.add_argument("--out", help="where to write the new subset")
     ap.add_argument("--stats", action="store_true", help="print what the base (and the new) subset holds")
     a = ap.parse_args()
@@ -118,8 +142,12 @@ def main() -> int:
     counts = corpus_counts(tok, a.corpus) if a.corpus else Counter()
     from_corpus = set(covering(counts, a.coverage)) if counts else set()
     have = set(base)
+    if a.latin and (a.add or a.corpus):
+        sys.exit("--latin cannot be combined with --add or --corpus")
+    if a.latin and not a.base:
+        sys.exit("--latin needs --base data/draft_vocab_en.bin")
     added = [i for i in range(n) if i not in have and (kinds[i] & want or i in from_corpus)]
-    ids = base + added
+    ids = latin_subset(tok, base) if a.latin else base + added
 
     def stats(label, sel):
         counts = {nm: sum(1 for i in sel if nm in kinds[i]) for nm in SCRIPTS}
@@ -129,7 +157,7 @@ def main() -> int:
     if a.stats or not a.out:
         if base:
             stats("base", base)
-        if added:
+        if added or a.latin:
             stats("new", ids)
     if counts:
         print(f"corpus: {sum(counts.values())} token occurrences, {len(counts)} distinct; "
@@ -138,7 +166,7 @@ def main() -> int:
               f"{outside(counts, ids):.2%}")
     if a.out:
         Path(a.out).write_bytes(array("i", ids).tobytes())
-        print(f"wrote {a.out}: {len(ids)} ids ({len(added)} added)")
+        print(f"wrote {a.out}: {len(ids)} ids ({len(ids) - len(base)} net)")
     return 0
 
 

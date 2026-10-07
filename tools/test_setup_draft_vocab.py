@@ -48,6 +48,16 @@ class Refresh(unittest.TestCase):
             setup.refresh_draft_vocab(rt, "cyrillic")                       # again: nothing changes
             self.assertEqual(hashlib.sha256((rt / "draft_vocab.bin").read_bytes()).hexdigest(), want)
 
+    def test_latin_replaces_the_default_subset(self):
+        want = hashlib.sha256((ROOT / "data" / setup.DRAFT_VOCABS["latin"]).read_bytes()).hexdigest()
+        with tempfile.TemporaryDirectory() as d:
+            rt = Path(d)
+            (rt / "draft_vocab.bin").write_bytes((ROOT / "data" / setup.DRAFT_VOCABS["cjk"]).read_bytes())
+            setup.refresh_draft_vocab(rt, "latin")
+            self.assertEqual(hashlib.sha256((rt / "draft_vocab.bin").read_bytes()).hexdigest(), want)
+            setup.refresh_draft_vocab(rt, "latin")                          # again: nothing changes
+            self.assertEqual(hashlib.sha256((rt / "draft_vocab.bin").read_bytes()).hexdigest(), want)
+
 
     def test_fr_replaces_a_shipped_subset_and_back(self):
         # #597: the French subset is a shipped one too - a later --draft-vocab cjk (or en) replaces it again, while a
@@ -88,8 +98,8 @@ class SmallCardNote(unittest.TestCase):
         self.assertTrue(note)
         self.assertIn("--draft-vocab en", " ".join(note))
         self.assertIn("the draft head does not fit", " ".join(note))
-        for vram, chosen in ((16.0, None), (24.0, None), (12.0, "en"), (12.0, "cyrillic"), (12.0, "fr"), (12.0, "cjk"),
-                             (0.0, None)):
+        for vram, chosen in ((16.0, None), (24.0, None), (12.0, "en"), (12.0, "cyrillic"), (12.0, "fr"),
+                             (12.0, "latin"), (12.0, "cjk"), (0.0, None)):
             self.assertEqual(setup.draft_vocab_note(vram, chosen), [], (vram, chosen))
 
     def test_sizes_follow_the_shipped_subsets(self):
@@ -100,7 +110,7 @@ class SmallCardNote(unittest.TestCase):
             if not p.exists():
                 self.skipTest(f"data/{name} is not in this checkout")
             sizes[choice] = p.stat().st_size // 4
-        for choice in ("en", "cyrillic", "fr"):
+        for choice in ("en", "cyrillic", "fr", "latin"):
             want = setup.DRAFT_VOCAB_MIB["cjk"] * sizes[choice] / sizes["cjk"]
             self.assertAlmostEqual(setup.DRAFT_VOCAB_MIB[choice], want, delta=3)
 
