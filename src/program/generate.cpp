@@ -9059,6 +9059,12 @@ int main(int argc, char** argv) {
                     }
                 }
             }
+            // The disk attempt above ran make_room before reading its file, so a failed disk load (a damaged file,
+            // an admission refusal) can have evicted the entry `parked` named: recompute the RAM match before the
+            // take, so a stale index never takes the wrong conversation or throws.
+            if (!incoming)
+                parked = conversations.best(ids, req_imgs, want_cvec,
+                                             o.conversation_cache_similarity, o.conversation_cache_n_min);
             if (!incoming && parked.tokens > std::max(resume, slot_tokens)) incoming.emplace(conversations.take(parked.index));
             if (incoming) slot_source = -1;
             // Reject the entire image before parking/overwriting the outgoing
