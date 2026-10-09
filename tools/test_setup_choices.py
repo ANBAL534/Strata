@@ -74,6 +74,15 @@ class GgufDirShards(unittest.TestCase):
                  "Swift-Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00002-of-00002.gguf"]
         self.assertEqual(self.shards(swift + ["mmproj-Swift-Qwen3.8-Flash-Next-BF16.gguf"], "swift", "Q2_0"), swift)
 
+    def test_swift_iq3_s_is_a_published_choice(self):
+        # UkisAI published Swift's IQ3_S on 2026-10-07: the family's own two shards, and gguf_choice maps them
+        names = ["Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf",
+                 "Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00002-of-00002.gguf"]
+        self.assertEqual(self.shards(names + ["mmproj-Swift-Qwen3.8-Flash-Next-BF16.gguf"], "swift", "IQ3_S"), names)
+        self.assertEqual(setup.gguf_choice(names[0]), ("swift", "IQ3_S"))
+        self.assertIn("IQ3_S", [m for m in setup.MODELS
+                                if "swift" in setup.MODELS[m].get("families", ("qwen", "swift"))])
+
     def test_four_unsloth_shards(self):
         names = ["Qwen3.8-Flash-Next-UD-Q4_K_XL-%05d-of-00004.gguf" % i for i in range(1, 5)]
         self.assertEqual(self.shards(names + ["mmproj-F16.gguf"], model="Q4_K_XL"), names)

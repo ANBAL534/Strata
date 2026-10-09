@@ -39,13 +39,16 @@ PROFILES = {
     "128GB-1x24GB": (127.8, [card(0, "NVIDIA GeForce RTX 4090", 24.0, "89")]),
 }
 # (family, model): None = the recommended size
-MODELS = [("qwen", None), ("qwen", "Q2_0"), ("qwen", "IQ3_XXS"), ("qwen", "IQ3_S"), ("unsloth", "UD-Q4_K_XL")]
+MODELS = [("qwen", None), ("qwen", "Q2_0"), ("qwen", "IQ3_XXS"), ("qwen", "IQ3_S"),
+          ("swift", "IQ3_S"), ("unsloth", "UD-Q4_K_XL")]
 
 
 class FakeGGUF:
-    """gguf_reader.GGUFFile: shard 2 holds the PLE table."""
+    """gguf_reader.GGUFFile: shard 2 holds the PLE table (the original's files); Swift's files hold it in shard 1."""
     def __init__(self, path):
-        names = ["per_layer_token_embd.weight"] if "00002-of" in str(path) else ["blk.0.ffn_up_exps.weight"]
+        p = str(path)
+        ple = ("00001-of" in p) if "Swift" in p else ("00002-of" in p)
+        names = ["per_layer_token_embd.weight"] if ple else ["blk.0.ffn_up_exps.weight"]
         self.tensors = [types.SimpleNamespace(name=n) for n in names]
 
 
