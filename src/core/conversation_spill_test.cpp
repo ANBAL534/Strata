@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <string>
 #include <vector>
 #include <chrono>
@@ -158,6 +159,20 @@ int main() {
     check(small.open(dir, id, newest, error), "open with a budget for one");
     check(small.size() == 1, "budget keeps one");
     check(small.disk_evictions() >= 1, "budget evicted the oldest");
+
+    // a process killed mid-write leaves the writer's hidden temporary beside the spill file (a 6 GB one here, on
+    // the user's PC): the scan at open is the only thing that removes it, and it must not touch anyone else's.
+    const fs::path abandoned = dir / ".strata-conv-99.sess.0123456789abcdef.tmp";
+    { std::ofstream(abandoned) << "half a conversation"; }
+    const fs::path foreign_temp = dir / ".strata-notes.0123456789abcdef.tmp";   // not a spill file's temp
+    { std::ofstream(foreign_temp) << "not ours"; }
+    ConversationSpillCache wiped;
+    check(wiped.open(dir, id, 1ull << 30, error), "open with an abandoned temp");
+    check(!fs::exists(abandoned), "abandoned spill temp removed at open");
+    check(fs::exists(foreign_temp), "a foreign dot file is left alone");
+    check(wiped.stale_files_wiped() >= 1, "the abandoned temp counts as a stale file wiped");
+    check(wiped.size() == 1, "the temp is not indexed as a conversation");
+    fs::remove(foreign_temp);
 
     // the RAM cache handing its evictions to the disk tier: make_room's spill callback writes what it drops.
     fs::remove_all(dir);

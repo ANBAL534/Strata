@@ -164,7 +164,10 @@ bool ConversationSpillCache::open(const std::filesystem::path& directory, Sessio
             const auto status = it->symlink_status(ec);
             if (ec) break;
             const std::string name = it->path().filename().string();
-            if (name.rfind("strata-conv-", 0) != 0) continue;
+            // the writer's temporary beside a spill file is hidden (".<name>.<hex>.tmp", conversation_file.cpp),
+            // and a process killed mid-write leaves it behind: this scan is the only thing that removes it.
+            const bool ours = name.rfind("strata-conv-", 0) == 0 || name.rfind(".strata-conv-", 0) == 0;
+            if (!ours) continue;
             if (!std::filesystem::is_regular_file(status)) continue;
             if (it->path().extension() == ".meta") metas.push_back(it->path());
             else if (it->path().extension() == ".tmp") { std::filesystem::remove(it->path(), ec); if (!ec) ++stale_files_wiped_; ec.clear(); }
