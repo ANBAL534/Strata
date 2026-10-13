@@ -574,7 +574,7 @@ class ToolCall:
 
 @dataclass
 class Event:
-    kind: str                     # "reasoning" | "content" | "tool_call"
+    kind: str                     # "reasoning" | "content" | "tool_call" | internal "tool_error"
     text: str = ""
     call: ToolCall | None = None
 
@@ -815,7 +815,7 @@ class OutputParser:
     until it is complete, so clients never see `<tool_` or `</thi`."""
 
     def __init__(self, thinking: bool = True, tools: list[dict] | None = None, stream_tools: bool = False,
-                 recover: bool = False, repair_names: bool = True):
+                 recover: bool = False, repair_names: bool = True, retry_unknown_tools: bool = False):
         self.state = "reasoning" if thinking else "content"
         self.buf = ""
         self.lead = False
@@ -828,7 +828,7 @@ class OutputParser:
         # #804/#1058: calls found inside the reasoning wait here as [raw text, ToolCall | None] until the turn shows
         # they were acts: only whitespace (or more calls) after them, then the end of the turn or `</think>`.  The
         # reasoning text before them is tracked (code fence, inline code, current line) to tell an act from a quote.
-        self.pending: list[list] = []
+        self.pending: list[list] = []       # [raw call, repaired ToolCall | None, unknown ToolCall | None]
         self.rescued = 0             # calls delivered from the reasoning
         self.refused = 0             # declared calls kept as reasoning text (quoted, or the turn was cut)
         self.fence, self.line, self.ticks = "", "", 0
@@ -842,6 +842,8 @@ class OutputParser:
         # client cannot run.  An undeclared name used to go out as a call: routers reject it ("routed provider
         # emitted undeclared client tool") and the stream dies mid-turn, cutting the conversation.
         self.repair_names = repair_names
+        # Opt-in: return an undeclared call as structured feedback for a bounded in-server retry.
+        self.retry_unknown_tools = retry_unknown_tools
         self.bare = False            # the call being read opened with <function= alone (no <tool_call> around it)
         self.batch = False           # the call being finished is followed by another in the same wrapper
         self._reset_scan()
@@ -964,11 +966,13 @@ class OutputParser:
     def _release(self, deliver: bool) -> list[Event]:
         """Settle the calls waiting in self.pending: events for real calls, or all of it back as reasoning text."""
         out = []
-        for raw, call in self.pending:
+        for raw, call, invalid in self.pending:
             if call is not None and deliver:
                 out.append(Event("tool_call", call=call))
                 self.rescued += 1
-            elif call is None or not deliver:
+            elif invalid is not None and deliver:
+                out.append(Event("tool_error", call=invalid))
+            else:
                 if call is not None:
                     self.refused += 1
                 if raw:
@@ -999,14 +1003,15 @@ class OutputParser:
                 if b < 0:
                     return out
                 name = rest[a + 10:b]
-                if self.repair_names and self.schemas and name not in self.schemas:
-                    fixed = repair_call_name(name, self.schemas)
+                if self.schemas and name not in self.schemas and (self.retry_unknown_tools or self.repair_names):
+                    fixed = repair_call_name(name, self.schemas) if self.repair_names else None
                     if fixed:
                         name = fixed                       # stream it under the declared name
                     else:
                         # undeclared: nothing is announced (a client that runs the call would run a tool that was
                         # never declared); the whole call is decided when it ends - nested repair, else text
-                        self.ss, self.sp = "suppressed", self.sp + b + 1
+                        self.ss = "suppressed_unknown" if self.retry_unknown_tools else "suppressed"
+                        self.sp += b + 1
                         return out
                 self.scall = ToolCall(name=name, arguments={})
                 props = ((self.schemas.get(name) or {}).get("parameters") or {}).get("properties") or {}
@@ -1115,26 +1120,34 @@ class OutputParser:
                 body = self.buf[len(CALL_START):]
                 end, think = call_end(body), body.find(THINK_END)
                 if end >= 0 and (think < 0 or think >= end):
-                    call = None
+                    call, invalid = None, None
                     try:
                         name = body[:end].strip()[len("<function="):].split(">", 1)[0].strip()
                         if name in self.schemas:
                             call = parse_tool_call(body[:end], self.schemas.get(name))
-                        elif self.repair_names:
-                            fixed = self._repair_call(name, body[:end])
+                        else:
+                            fixed = self._repair_call(name, body[:end]) if self.repair_names else None
                             if fixed:
                                 fname, fbody = fixed
                                 call = parse_tool_call(fbody, self.schemas.get(fname))
                                 call.name = fname
+                            elif self.retry_unknown_tools and self.schemas:
+                                invalid = parse_tool_call(body[:end])
                     except ValueError:
                         pass
                     raw = self.buf[:len(CALL_START) + end + len(CALL_END)]
-                    if call is not None or self.pending:
-                        self.pending.append([raw, call])    # settled by what follows it (see __init__)
+                    if call is not None or invalid is not None or self.pending:
+                        self.pending.append([raw, call, invalid])  # settled by what follows it (see __init__)
                     else:
                         out.append(Event("reasoning", self._track(raw)))
                     self.buf = body[end + len(CALL_END):]
                     self.state = "reasoning"
+                    if self.pending[-1][2] is not None:
+                        if self.buf.lstrip().startswith(CALL_START):
+                            return out + [Event("tool_error", call=self.pending[-1][2])]
+                        if self.buf.startswith(THINK_END):
+                            return out + [Event("tool_error", call=self.pending[-1][2])]
+                        return out
                 elif think >= 0:                     # the thinking ended inside it: it never was a call
                     out += self._release(False)
                     out.append(Event("reasoning", self._track(self.buf[:len(CALL_START) + think])))
@@ -1158,9 +1171,13 @@ class OutputParser:
                     if not self.buf:
                         return out
                     if self.buf.startswith(CALL_START):
+                        if self.pending[-1][2] is not None:
+                            return out + [Event("tool_error", call=self.pending[-1][2])]
                         self.state = "rcall"
                     elif self.buf.startswith(THINK_END):
                         out += self._release(True)
+                        if any(e.kind == "tool_error" for e in out):
+                            return out                 # the server resumes from the complete call plus error feedback
                     elif CALL_START.startswith(self.buf) or THINK_END.startswith(self.buf):
                         return out
                     else:
@@ -1324,12 +1341,25 @@ class OutputParser:
                         self.buf = whole
                     else:
                         out += self._scan()
+                if self.ss == "suppressed_unknown" and i >= 0 and drop is not None:
+                    try:
+                        invalid = parse_tool_call(self.buf[:i])
+                    except ValueError:
+                        invalid = None
+                    if invalid is not None:
+                        self.buf = ""
+                        self.state, self.lead = "content", True
+                        self._reset_scan()
+                        return out + [Event("tool_error", call=invalid)]
                 if i < 0 or drop is None:
                     return out
                 body = self.buf[:i]
                 self.buf = self.buf[i + drop:]
                 batch, self.batch = self.batch, False
                 out += self._finish_call(body)
+                if any(e.kind == "tool_error" for e in out):
+                    self.buf = ""                     # discard text after the failed call in this delta
+                    return out
                 if batch and out[-1].kind == "tool_call":
                     self.state, self.lead = "call", False
 
@@ -1372,6 +1402,17 @@ class OutputParser:
                     return out + [Event("tool_call", call=call)]
                 except ValueError:
                     pass
+        if self.state == "call" and self.ss == "suppressed_unknown":
+            head = self.buf.strip()
+            name = head[len(FUNC_START):].split(">", 1)[0].strip() if head.startswith(FUNC_START) else ""
+            try:
+                invalid = parse_tool_call(self.buf)
+            except ValueError:
+                invalid = None
+            if invalid is not None and name not in self.schemas and function_end(self.buf) >= 0:
+                self.buf, self.state, self.lead = "", "content", True
+                self._reset_scan()
+                return [Event("tool_error", call=invalid)]
         if self.state == "reasoning" and self.buf == THINK_END:   # the output ends on a held `</think>`: its end
             self.buf, self.state = "", "content"
         if self.buf:
@@ -1382,18 +1423,44 @@ class OutputParser:
             self.buf = ""
         return out
 
+    def resume_after_tool_error(self, thinking: bool) -> None:
+        """Start parsing the corrected assistant turn after the server added a tool error result."""
+        self.state = "reasoning" if thinking else "content"
+        self.buf, self.lead, self.bare, self.batch = "", False, False, False
+        self.pending.clear()
+        self.fence, self.line, self.ticks = "", "", 0
+        self._reset_scan()
+
+    def pending_tool_error(self) -> Event | None:
+        """Return feedback for an invalid call held in reasoning, if it ended as a real call."""
+        if (self.retry_unknown_tools and self.state == "reasoning" and not self.buf and len(self.pending) == 1
+                and self.pending[0][2] is not None):
+            return Event("tool_error", call=self.pending[0][2])
+        return None
+
     def _finish_call(self, body: str) -> list[Event]:
         """A whole call body in the template's form -> its tool_call event.  With recover, one that still does not
         parse is the text it is instead of an error that ends the request."""
         name = body.strip()[len(FUNC_START):].split(">", 1)[0].strip()
         bare, self.bare = self.bare, False
-        if self.repair_names and self.schemas and name not in self.schemas:
-            fixed = self._repair_call(name, body)
-            if fixed is None:                       # names no declared tool: the text it is, not a call
-                self._reset_scan()
-                self.state = "content"
-                return [Event("content", self._track(body if bare else CALL_START + body + CALL_END))]
-            name, body = fixed
+        if self.schemas and name not in self.schemas:
+            fixed = self._repair_call(name, body) if self.repair_names else None
+            if fixed is None:
+                if self.retry_unknown_tools:
+                    try:
+                        invalid = parse_tool_call(body)
+                    except ValueError:
+                        invalid = None
+                    if invalid is not None:
+                        self._reset_scan()
+                        self.state = "content"
+                        return [Event("tool_error", call=invalid)]
+                if self.repair_names:               # names no declared tool: the text it is, not a call
+                    self._reset_scan()
+                    self.state = "content"
+                    return [Event("content", self._track(body if bare else CALL_START + body + CALL_END))]
+            else:
+                name, body = fixed
         try:
             call = parse_tool_call(body, self.schemas.get(name))
         except ValueError:

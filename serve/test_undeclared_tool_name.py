@@ -166,6 +166,36 @@ class ResponsesPath(unittest.TestCase):
         self.assertEqual((item["type"], item["name"], item["namespace"]), ("function_call", "js", "mcp__node"))
 
 
+class UnknownToolRetryParser(unittest.TestCase):
+    def test_unknown_complete_call_becomes_internal_error_only_when_enabled(self):
+        text = "</think>\n\n<tool_call>\n<function=not_a_tool>\n<parameter=code>\nx\n</parameter>\n</function>\n</tool_call>"
+        evs = events(text, repair=True)
+        self.assertEqual(calls(evs), [])
+        self.assertIn("<function=not_a_tool>", "".join(e.text for e in evs if e.kind == "content"))
+
+        parser = OutputParser(thinking=True, tools=SCHEMA, stream_tools=True, repair_names=True,
+                              retry_unknown_tools=True)
+        got = []
+        for i in range(0, len(text), 3):
+            got += parser.feed(text[i:i + 3])
+        self.assertEqual([e.kind for e in got if e.kind in ("tool_start", "tool_args", "tool_call")], [])
+        errors = [e for e in got if e.kind == "tool_error"]
+        self.assertEqual(len(errors), 1)
+        self.assertEqual((errors[0].call.name, errors[0].call.arguments), ("not_a_tool", {"code": "x"}))
+
+    def test_call_in_reasoning_is_held_until_the_model_stops(self):
+        text = "<tool_call>\n<function=not_a_tool>\n<parameter=code>\nx\n</parameter>\n</function>\n</tool_call></think>\n\n"
+        parser = OutputParser(thinking=True, tools=SCHEMA, retry_unknown_tools=True)
+        got = parser.feed(text)
+        self.assertEqual([e.kind for e in got if e.kind == "tool_error"], ["tool_error"])
+
+    def test_unterminated_call_never_becomes_an_error(self):
+        parser = OutputParser(thinking=True, tools=SCHEMA, retry_unknown_tools=True)
+        got = parser.feed("</think>\n\n<tool_call>\n<function=not_a_tool>\n<parameter=code>\nx")
+        got += parser.finish("length")
+        self.assertFalse([e for e in got if e.kind == "tool_error"])
+
+
 if __name__ == "__main__":
     unittest.main()
 
