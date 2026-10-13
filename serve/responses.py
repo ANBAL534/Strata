@@ -27,7 +27,7 @@ import json
 import time
 import uuid
 
-from serve.frontend import Event, _late_system_to_user, _parts_of, effort_kwargs
+from serve.frontend import Event, _late_system_to_user, _parts_of, effort_kwargs, repair_call_name
 
 ENCRYPTED_PREFIX = "strata.r1:"                   # our own reasoning replay strings; others' are ignored
 HOSTED_TOOLS = ("web_search", "web_search_preview", "file_search", "computer_use_preview", "computer_use",
@@ -632,7 +632,10 @@ class Assembler:
         return out
 
     def _call_item(self, ev: Event) -> dict:
-        namespace, name, kind = self.names.get(ev.call.name, (None, ev.call.name, "function"))
+        key = ev.call.name
+        if key not in self.names and self.names:      # the parser repairs names; this is the same map on the
+            key = repair_call_name(key, self.names) or key   # request's spellings (namespaces, `ns__tool`)
+        namespace, name, kind = self.names.get(key, (None, ev.call.name, "function"))
         if kind == "custom":
             item = {"id": new_id("ctc"), "type": "custom_tool_call", "status": "in_progress", "call_id": ev.call.id,
                     "name": name, "input": ""}

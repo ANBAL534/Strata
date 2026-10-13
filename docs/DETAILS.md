@@ -810,6 +810,16 @@ print(r.choices[0].message.content)
   second call's parameters merge into the first). Anything else in those forms stays the text it is. Measured on
   1,462 agent turns (Qwen3.8 under Claude Code, from signalnine/q27's drift corpus): 98.3% read as intended with it,
   92.9% without. Off by default, so what a client gets back is unchanged unless you turn it on.
+- **Undeclared tool names repaired (on).** The model sometimes names a call after the template's own block: it wraps
+  a real call in `<function=tools>` (the `<tools>` block's word) or writes `tools/write_stdin` (that word as a
+  prefix). A call naming a tool the request did not declare used to go out as that call; routers reject it (seen
+  through OpenCodex: "routed provider emitted undeclared client tool 'tools'") and the stream dies mid-turn,
+  cutting the conversation. Now the name is mapped to the declared tool it plainly meant - case, spacing, quotes,
+  `ns.tool` for `ns__tool`, a long name's unique suffix, the block word as a prefix - a declared call nested
+  inside a "tools" wrapper is taken as the call, and one tool declared with no name written is that call. What
+  cannot be mapped becomes the text it is: the turn completes and the agent loop goes on. Checked by
+  `serve/test_undeclared_tool_name.py` (15 cases, incl. the live wrapper shapes fed 3 characters at a time).
+  `"tool_name_repair": false` in `strata-<model>.json` restores the old pass-through.
 - **Prefill progress in the stream (opt-in).** `"return_progress": true` puts that progress on the stream instead of
   sending only the keep-alive, as one extra field on a chunk with an empty delta: `prompt_progress` with `total`,
   `cache`, `processed` and `time_ms`. Those are llama.cpp's four fields and mean the same there (`time_ms` is the time
