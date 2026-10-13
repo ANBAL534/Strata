@@ -817,9 +817,16 @@ print(r.choices[0].message.content)
   cutting the conversation. Now the name is mapped to the declared tool it plainly meant - case, spacing, quotes,
   `ns.tool` for `ns__tool`, a long name's unique suffix, the block word as a prefix - a declared call nested
   inside a "tools" wrapper is taken as the call, and one tool declared with no name written is that call. What
-  cannot be mapped becomes the text it is: the turn completes and the agent loop goes on. Checked by
-  `serve/test_undeclared_tool_name.py` (15 cases, incl. the live wrapper shapes fed 3 characters at a time).
+  cannot be mapped becomes the text it is: the turn completes and the agent loop goes on. Checked by the streaming
+  parser tests in `serve/test_undeclared_tool_name.py`, including the live wrapper shapes fed 3 characters at a time.
   `"tool_name_repair": false` in `strata-<model>.json` restores the old pass-through.
+- **Unknown tool calls can be retried with error feedback (opt-in).** `"tool_name_retry": true` in
+  `strata-<model>.json` makes a complete call whose name cannot be matched to a declared tool return an error result
+  to the model, naming the tools the request declared, and continues generation once so it can correct the call.
+  The rejected call is never run or sent to the client. Calls with a recognizable name are still repaired first.
+  Truncated calls and requests with no tools are not retried. The retry shares the request's output-token limit; if
+  there is not enough room for the feedback and another token, the client gets a plain explanation that the call
+  was not run. Off by default, so existing behavior is unchanged.
 - **Prefill progress in the stream (opt-in).** `"return_progress": true` puts that progress on the stream instead of
   sending only the keep-alive, as one extra field on a chunk with an empty delta: `prompt_progress` with `total`,
   `cache`, `processed` and `time_ms`. Those are llama.cpp's four fields and mean the same there (`time_ms` is the time

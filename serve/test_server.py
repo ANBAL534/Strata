@@ -1156,6 +1156,101 @@ class ToolCallRecoverySwitch(unittest.TestCase):
         self.assertEqual(self.run_reply(True), [ToolCallRecovery.CALL])
 
 
+class UnknownToolRetry(unittest.TestCase):
+    INVALID = ("</think>\n\n<tool_call>\n<function=ghost>\n<parameter=q>\n2+2\n</parameter>\n"
+               "</function>\n</tool_call>")
+    VALID = "</think>\n\n<tool_call>\n<function=search>\n<parameter=q>\n2+2\n</parameter>\n</function>\n</tool_call>"
+    TOOLS = [{"name": "search", "parameters": {"properties": {"q": {"type": "string"}}}}]
+
+    def run_reply(self, scripts, retry):
+        tok = ByteTokenizer()
+        engine = MockEngine(tok, scripts, max_context=CTX)
+        svc = Service(engine, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        svc.tool_name_retry = retry
+        with contextlib.redirect_stdout(io.StringIO()):
+            events = list(svc.run(tok.encode("hi"), True, self.TOOLS, 3000, {}, threading.Event()))
+        return engine, [(kind, value) for kind, value in events if kind != "ping"]
+
+    def test_retry_receives_error_and_returns_the_corrected_call(self):
+        engine, events = self.run_reply([self.INVALID, self.VALID], True)
+        calls = [e.call for kind, e in events if kind == "event" and e.kind == "tool_call"]
+        self.assertEqual([(c.name, c.arguments) for c in calls], [("search", {"q": "2+2"})])
+        self.assertEqual(engine.turns, 2)
+        prompt = engine.tok.decode(engine.last_prompt)
+        self.assertIn("the tool name 'ghost' is not declared", prompt)
+        self.assertIn("<tool_response>", prompt)
+        self.assertNotIn("error: the tool name", "".join(e.text for kind, e in events
+                                                             if kind == "event" and e.kind == "content"))
+
+    def test_a_call_in_thinking_is_retried_only_after_it_is_confirmed(self):
+        thought_call = self.INVALID.replace("</think>\n\n", "", 1) + "</think>\n\n"
+        engine, events = self.run_reply([thought_call, self.VALID], True)
+        calls = [e.call for kind, e in events if kind == "event" and e.kind == "tool_call"]
+        self.assertEqual([(c.name, c.arguments) for c in calls], [("search", {"q": "2+2"})])
+        self.assertEqual(engine.turns, 2)
+        self.assertIn("the tool name 'ghost' is not declared", engine.tok.decode(engine.last_prompt))
+
+    def test_default_does_not_retry_and_keeps_unknown_name_as_text(self):
+        engine, events = self.run_reply([self.INVALID, self.VALID], False)
+        content = "".join(e.text for kind, e in events if kind == "event" and e.kind == "content")
+        self.assertIn("<function=ghost>", content)
+        self.assertEqual(engine.turns, 1)
+
+    def test_a_second_unknown_name_is_reported_without_another_retry(self):
+        engine, events = self.run_reply([self.INVALID, self.INVALID], True)
+        content = "".join(e.text for kind, e in events if kind == "event" and e.kind == "content")
+        self.assertEqual(engine.turns, 2)
+        self.assertIn("Tool call was not run", content)
+        self.assertEqual(content.count("Tool call was not run"), 1)
+        self.assertFalse([e for kind, e in events if kind == "event" and e.kind == "tool_error"])
+
+    def test_no_budget_for_feedback_returns_a_clear_non_call(self):
+        tok = ByteTokenizer()
+        engine = MockEngine(tok, self.INVALID, max_context=CTX)
+        svc = Service(engine, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        svc.tool_name_retry = True
+        with contextlib.redirect_stdout(io.StringIO()):
+            events = list(svc.run(tok.encode("hi"), True, self.TOOLS, 300, {}, threading.Event()))
+        content = "".join(value.text for kind, value in events
+                          if kind == "event" and value.kind == "content")
+        calls = [value for kind, value in events if kind == "event" and value.kind == "tool_call"]
+        self.assertFalse(calls)
+        self.assertIn("Tool call was not run", content)
+
+    def test_a_second_unknown_name_after_a_valid_call_is_not_retried(self):
+        mixed = self.VALID + "\n" + self.INVALID.removeprefix("</think>\n\n")
+        engine, events = self.run_reply([self.INVALID, mixed], True)
+        calls = [e.call for kind, e in events if kind == "event" and e.kind == "tool_call"]
+        self.assertEqual([(c.name, c.arguments) for c in calls], [("search", {"q": "2+2"})])
+        self.assertEqual(engine.turns, 2)
+
+    def test_api_returns_the_retry_as_a_tool_call(self):
+        tok = ByteTokenizer()
+        engine = MockEngine(tok, [self.INVALID, self.VALID], max_context=CTX)
+        svc = Service(engine, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        svc.tool_name_retry = True
+        httpd = serve(svc, port=0)
+        try:
+            body = {"model": "m", "stream": False, "max_tokens": 2800,
+                    "messages": [{"role": "user", "content": "2+2?"}],
+                    "tools": [{"type": "function", "function": {"name": "search", "parameters": {
+                        "type": "object", "properties": {"q": {"type": "string"}}}}}]}
+            req = urllib.request.Request(f"http://127.0.0.1:{httpd.server_address[1]}/v1/chat/completions",
+                                         data=json.dumps(body).encode(),
+                                         headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=20) as r:
+                result = json.loads(r.read())
+            choice = result["choices"][0]
+            self.assertEqual(choice["finish_reason"], "tool_calls")
+            function = choice["message"]["tool_calls"][0]["function"]
+            self.assertEqual(function["name"], "search")
+            self.assertEqual(json.loads(function["arguments"]), {"q": "2+2"})
+            self.assertNotIn("ghost", choice["message"].get("content") or "")
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+
+
 class UnfinishedToolCall(unittest.TestCase):
     """#211: a call the output ends inside is not reported as a whole one - its streamed JSON is not closed and the
     finish reason is not "tool_calls" / "tool_use" - so a client can tell it from a call to run."""

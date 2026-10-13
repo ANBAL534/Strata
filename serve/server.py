@@ -2860,6 +2860,7 @@ class Service:
         self.anthropic_think_unasked = True               # #278: "anthropic_thinking": "on_request" -> False
         self.tool_call_recovery = False                   # opt-in: tool calls in forms next to the template's
         self.tool_name_repair = True                      # on: a call naming an undeclared tool is repaired (see OutputParser)
+        self.tool_name_retry = False                      # opt-in: feed an unknown name back to the model and retry once
         self.stop_ids = set(tokenizer.encode(IM_END, parse_special=True) +
                             tokenizer.encode("<|endoftext|>", parse_special=True))
 
@@ -3689,7 +3690,7 @@ class Service:
                       f"the answer (budget {budget})", flush=True)
                 budget = max(1, max_new - reserve)
         parser = OutputParser(thinking=thinking, tools=tools, stream_tools=True, recover=self.tool_call_recovery,
-                              repair_names=self.tool_name_repair)
+                              repair_names=self.tool_name_repair, retry_unknown_tools=self.tool_name_retry)
         detok, n, finish = Detokenizer(self.tok), 0, "length"
         run_tok, run_len, repeated = None, 0, False     # #606: the current run of one repeated token
         thinking_n = 0                                  # tokens written while thinking (Responses' reasoning_tokens)
@@ -3722,6 +3723,8 @@ class Service:
         nf_retried = False                              # #879: the request was sent again after non-finite logits
         timings, before = None, None                    # this request's timings; the engine's `last` before it
         recovery_count, reasoning_text, repeat_coverage = 0, "", 0.0
+        unknown_tool_retries = 0
+        tool_call_before_error = False
         looped, next_loop_check = False, LOOP_CHECK_EVERY       # #728: reasoning that repeats whole passages
         raw_ids = []                                    # every generated id (STRATA_DEBUG: dump raw model text)
         emb, self.embeddings.path = getattr(self.embeddings, "path", None), None   # this run's to delete now
@@ -3812,6 +3815,7 @@ class Service:
                         gen = self.engine.generate(prompt, max_new - n, sampling, cancel, embeddings=emb) if emb \
                             else self.engine.generate(prompt, max_new - n, sampling, cancel)
                         recover_prompt = None
+                        retry_tool_error = None
                         seg, wrap, leaving = [], False, False   # this pass's tokens; the budget is reached; closed
                         nonfinite = False               # #879: the engine ended this pass on non-finite logits
                         opens = False                   # the thinking is over: write the forced call's opening
@@ -3849,6 +3853,11 @@ class Service:
                                 piece = detok.push(t)
                                 tail = (tail + piece)[-2:]
                                 evs = cut(parser.feed(piece))
+                                errors = [ev for ev in evs if ev.kind == "tool_error"]
+                                retry_tool_error = errors[0] if errors else None
+                                if retry_tool_error is not None:
+                                    evs = [ev for ev in evs if ev.kind != "tool_error"]
+                                    finish = "stop"
                                 self._note(n, evs, st, rate)
                                 last_print = self._progress(last_print, st=st)
                                 for ev in evs:
@@ -3856,7 +3865,11 @@ class Service:
                                         reasoning_text += ev.text or ""
                                     if ev.kind in ("content", "tool_start", "tool_call"):
                                         answered = True
+                                    if ev.kind in ("tool_start", "tool_call"):
+                                        tool_call_before_error = True
                                     yield "event", ev
+                                if retry_tool_error is not None:
+                                    break
                                 if evs:
                                     last_out = time.perf_counter()
                                 elif time.perf_counter() - last_out >= KEEPALIVE_S:
@@ -3916,6 +3929,44 @@ class Service:
                             segment_done = getattr(self.engine, "last", None)
                             if segment_done is not None and segment_done is not segment_before:
                                 segments.append(dict(segment_done))
+                        if (retry_tool_error is None and self.tool_name_retry and finish == "stop"
+                                and not cancel.is_set()):
+                            retry_tool_error = parser.pending_tool_error()
+                        if retry_tool_error is not None and self.tool_name_retry and not cancel.is_set():
+                            invalid = retry_tool_error.call
+                            name = invalid.name if invalid is not None else "unknown"
+                            available = ", ".join(parser.schemas)
+                            message = (f"error: the tool name {name!r} is not declared in this request. Available tool names: "
+                                       f"{available}. The rejected call was not executed; choose one exact name and retry it, "
+                                       "preserving or correcting its arguments as needed.")
+                            im_end = self.tok.encode(IM_END, parse_special=True)
+                            im_start = self.tok.encode("<|im_start|>", parse_special=True)
+                            prefix = im_end + im_start + self.tok.encode("user\n<tool_response>\n", parse_special=False)
+                            suffix = self.tok.encode("\n</tool_response>", parse_special=False) + im_end
+                            suffix += im_start + self.tok.encode("assistant\n", parse_special=False)
+                            suffix += self.tok.encode("<think>\n" if thinking else "<think>\n\n</think>\n\n",
+                                                     parse_special=True)
+                            feedback = prefix + self.tok.encode(message, parse_special=False) + suffix
+                            if (not unknown_tool_retries and not tool_call_before_error
+                                    and n + len(feedback) < max_new):
+                                unknown_tool_retries += 1
+                                parser.resume_after_tool_error(thinking)
+                                prompt = prompt + seg + feedback
+                                n += len(feedback)
+                                raw_ids += feedback
+                                finish = "length"
+                                print(f"[strata] tool {name!r} is not declared; returning a tool error to the model and "
+                                      "continuing once so it can correct the call", flush=True)
+                                continue
+                            if invalid is not None:
+                                if not tool_call_before_error:
+                                    parser.resume_after_tool_error(thinking)
+                                final = cut(parser.finish(finish))
+                                for ev in final:
+                                    if ev.kind != "tool_error":
+                                        yield "event", ev
+                                yield "event", Event("content",
+                                    f"Tool call was not run: {name!r} is not one of the tools declared for this request.")
                         if nonfinite and not cancel.is_set():
                             # #879: the engine emitted none of the poisoned window's tokens and reads its next prompt
                             # from token 0.  Nothing sent yet: the same request once more, unseen by the client
@@ -4105,8 +4156,16 @@ class Service:
         finally:
             if emb:
                 Path(emb).unlink(missing_ok=True)
-        for ev in cut(parser.finish(finish)):
-            yield "event", ev
+        final = cut(parser.finish(finish))
+        if any(ev.kind in ("tool_start", "tool_call") for ev in final):
+            tool_call_before_error = True
+        for ev in final:
+            if ev.kind == "tool_error":
+                name = ev.call.name if ev.call is not None else "unknown"
+                yield "event", Event("content",
+                    f"Tool call was not run: {name!r} is not one of the tools declared for this request.")
+            else:
+                yield "event", ev
         if parser.rescued or parser.refused:
             self.totals["tool_calls_from_reasoning"] = self.totals.get("tool_calls_from_reasoning", 0) + parser.rescued
             print(f"[strata] tool calls inside the thinking: {parser.rescued} read as calls, {parser.refused} kept as "
@@ -6360,6 +6419,10 @@ def main() -> int:
     if not isinstance(repair, bool):
         raise SystemExit(f"[strata] config \"tool_name_repair\" must be true or false, not {repair!r}")
     svc.tool_name_repair = repair
+    retry = cfg.get("tool_name_retry", False)
+    if not isinstance(retry, bool):
+        raise SystemExit(f"[strata] config \"tool_name_retry\" must be true or false, not {retry!r}")
+    svc.tool_name_retry = retry
     rs = cfg.get("repeat_stop_tokens", REPEAT_STOP_TOKENS)   # #606: opt-out with 0
     if isinstance(rs, bool) or not isinstance(rs, int) or rs < 0:
         raise SystemExit(f"[strata] config \"repeat_stop_tokens\" must be a whole number >= 0 (0 = off), not {rs!r}")
