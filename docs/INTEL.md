@@ -481,6 +481,24 @@ Kernel level: IQ4_XS 107 -> 323 GB/s at 2 columns (61 -> 212 at 6), Q4_K/Q5_K 1.
 `STRATA_MMVQ_WIDE_K=0`. (`iq_parity` reports 10 "missing fixture" failures with and without the change: the oracle
 fixtures are not in the port's tree.)
 
+`STRATA_IQ3S_WIDE=1` (opt-in, 2026-10-10) reads the dense IQ3_S matrices (attn_q, attn_gate, ssm_out, attn_k, the
+shared experts' gate/up) with a wide kernel shaped like the Q4_K..IQ4_XS ones. unitrace, B70, IQ3_XXS, one card, T=1:
+worst attn_k 77 -> 123 GB/s, best attn_q 114 -> 307 GB/s; these matrices take 0.60 ms of kernel time per token
+instead of 1.36 ms. The greedy output parts from the default at token 198 of 256 (the sub-blocks are summed in
+another order). Measured again for 0.1.45 (B70, IQ3_S, stock-like config, 5 interleaved pairs): decode 33.39 -> 33.29 tok/s
+(-0.3%), 4K prompt 40.71 -> 40.79, so it stays opt-in; the gain the author reports is on two cards.
+
+**Q6_K decode kernels (0.1.45, #2340 leadgtr7, #2207 Andy Slater).** The Q6_K wide kernel took its six-bit offset (v - 32)
+through a per-byte saturating subtract; it is now four integer ops (bitwise equal), and the Q4_K / Q5_K / IQ4_XS / Q6_K
+kernels load the Q8_1 activations as one dword-vector. No switch. mmvq_bench Q6_K, B70: 2560x10240 1 column 44.7 -> 26.5 us,
+4 columns 64.5 -> 46.2; A750: 2560x10240 4 columns 251 -> 102 us. End to end on the B70 (IQ3_S, 5 interleaved pairs, answers
+identical): decode 32.24 -> 33.37 tok/s on a story prompt (+3.5%), 39.11 -> 40.77 after a 4K prompt (+4.2%), prompt rate unchanged.
+`STRATA_MMVQ_LARGE_GRF` (default on for Arc A-series only, `=1` forces it on, `=0` off) launches the 2-8 column wide kernels with
+256 registers per thread, where they spilled at 128 (the same bytes are produced either way). `STRATA_Q6_PLANAR` (default on,
+`=0` off) converts the Q6_K output head and the MTP draft head to ql / qh / scales / d planes at load (same bytes, no VRAM change,
+bitwise equal): 2560x248320 on a B70 800 -> 662 us (1 column), 1230 -> 1020 us (4 columns); end to end it adds +0.3% on the B70
+(33.16 -> 33.25 tok/s, within noise) on top of the kernel changes above.
+
 **Two-speed runs, explained (2026-09-30).** Identical greedy runs decode at either ~45 or ~39 tok/s. A per-gather
 trace of the PLE reader (`STRATA_PLE_TRACE=1`) shows the slow runs pay one 226 ms PLE read stall in the first
 decode round, after the window graphs are captured; every other read and round matches the fast runs. Prompt time
@@ -728,6 +746,18 @@ Measured on an Arc A750 (8 GB, `i915`, PCIe 4.0) with the Flash-Next IQ3_XXS in 
   1.3 s; the A750's PCIe link probes at 10.6 GB/s.
 - **A750 and the xe error counters.** The engine segfaults in a worker thread of the CPU pool when it exits (dmesg only, the server
   has already printed "stopped"); it is not a GPU event.
+- **The prompt's GDN recurrence runs a sub-group kernel on Alchemist** (`sycl/include/strata/prefill/gdn_xe.hpp`,
+  variant 6 of `gdn_recurrence_variant`). It keeps the column kernel's four row groups and their FMA chains in the same
+  order, but a 16-lane sub-group holds four columns x four row groups, so the two cross-row-group sums are sub-group
+  shuffles instead of SLM round trips and a token needs one work-group barrier instead of five (256 GRFs a thread).
+  Measured on an Arc A770 (16 GB, `xe`, oneAPI 2026.1 JIT), 2026-10-13: `gdn_parity --prefill-tokens 8192` 51.0 ->
+  24.5 ms, 32,768 tokens 204-236 -> 110-113 ms (48 heads), 0 mismatches; end to end, Coder IQ1_M, `--max-context
+  131072 --kv int8 --kv-resident 20480 --vram-reserve-mib 1200 --resident-experts`, prompt 386 -> 396-407 tok/s at
+  8K and 478-480 -> 511-518 tok/s at 32K, the same output tokens. On by default on Alchemist only, the column kernels everywhere else (not measured there). `STRATA_GDN_XE=0`
+  turns it off, `STRATA_GDN_XE=1` turns it on for any Intel GPU with 16-lane sub-groups. To check another Intel card:
+  `STRATA_GDN_XE=1 ./gdn_parity --selftest --prefill-only` (or `ctest -R prefill_gdn_parity`), and `--prefill-tokens
+  8192 --prefill-repeat 5` for the time of both kernels. Not taken: the same kernel with its state in SLM (no register
+  spills, the same bits, ~4x slower: 13.7 vs 3.1-3.3 ms at T=1000).
 
 ## Not done
 
