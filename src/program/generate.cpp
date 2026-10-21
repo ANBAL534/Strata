@@ -731,7 +731,7 @@ struct Options {
     /// is written here as a session file (the same format as the slot save/restore API) and can come back after a
     /// restart. Empty = off.
     std::string conversation_cache_spill_dir;
-    int64_t conversation_cache_disk_mib = 8192;   // the spill directory's limit (0 = off)
+    int64_t conversation_cache_disk_mib = 8192;   // the spill directory's limit, every fingerprint's files in it (0 = off)
     double conversation_cache_similarity = 0.0;   // least LCP/new-prompt fraction a disk hit may offer (range [0,1))
     int64_t conversation_cache_n_min = 0;         // least common-prefix tokens a disk hit may offer
     bool session_save_reclaim = false;
@@ -891,7 +891,8 @@ void usage() {
                  "  --session-min-free-mib N  --serve: disk space a SAVE must leave free (default 4096; 0 = no check)\n"
                  "  --conversation-cache-spill-dir DIR  --serve: keep conversations the RAM cache evicts on disk,\n"
                  "                       across restarts (default off; needs --conversation-cache-mib)\n"
-                 "  --conversation-cache-disk-mib N  --serve: the spill directory's limit (default 8192; 0 = off)\n"
+                 "  --conversation-cache-disk-mib N  --serve: the spill directory's limit: at startup the snapshots\n"
+                 "                       a rebuild or a K/V change left unreadable are deleted first (default 8192; 0 = off)\n"
                  "  --conversation-cache-similarity F  --serve: least common-prefix fraction a disk hit may offer\n"
                  "                       (default 0 = any; range [0,1))\n"
                  "  --conversation-cache-n-min N  --serve: least common-prefix tokens a disk hit may offer (default 0)\n"
