@@ -141,12 +141,6 @@ int main() {
     const auto rematched = again.best(continuing, a.live.imgs, false, 0.0, 0);
     check(bool(rematched) && rematched.tokens == (int64_t) a.live.ids.size(), "rematch after reopen");
 
-    // a foreign identity is refused and its files removed
-    ConversationSpillCache foreign;
-    check(foreign.open(dir, SessionFileIdentity{1, 2}, 1ull << 30, error), "open with foreign identity");
-    check(foreign.size() == 0, "foreign identity: nothing indexed");
-    check(fs::exists(dir / "strata-conv-1.sess"), "another identity's files are left alone");
-
     // budget eviction drops the oldest
     ConversationSpillCache tight;
     check(tight.open(dir, id, 1ull << 30, error), "open for budget test");
@@ -159,6 +153,25 @@ int main() {
     check(small.open(dir, id, newest, error), "open with a budget for one");
     check(small.size() == 1, "budget keeps one");
     check(small.disk_evictions() >= 1, "budget evicted the oldest");
+
+    // A new fingerprint (STRATA_VERSION is in it, so a rebuild is enough; --kv, --max-context and --kv-resident do
+    // it too) makes every byte in the directory unreadable, because session_file_read refuses a foreign one.
+    // Reopening must take those bytes with them: they are the directory's bytes, and the 32 GiB limit the user set
+    // measured none of them - on his PC one fingerprint change left 56 GiB of snapshots no build can load, under a
+    // limit of 32, and they never aged out.
+    ConversationSpillCache foreign;
+    check(foreign.open(dir, SessionFileIdentity{1, 2}, 1ull << 30, error), "open with foreign identity");
+    check(foreign.size() == 0, "foreign identity: nothing indexed");
+    check(!fs::exists(dir / "strata-conv-2.sess"), "a superseded fingerprint's session file goes with its sidecar");
+    check(!fs::exists(dir / "strata-conv-2.meta"), "a superseded fingerprint's sidecar is removed");
+    check(foreign.stale_files_wiped() >= 1, "the removed pair counts as a stale file wiped");
+
+    // with the directory emptied, the tier starts over on the new fingerprint instead of growing over the old one
+    ConversationSpillCache refilled;
+    check(refilled.open(dir, id, 1ull << 30, error), "open after the fingerprint wipe");
+    check(refilled.size() == 0, "a fingerprint change empties the directory");
+    SavedConversation c = sample(1500);
+    check(refilled.spill(c, error), "spill on the new fingerprint");
 
     // a process killed mid-write leaves the writer's hidden temporary beside the spill file (a 6 GB one here, on
     // the user's PC): the scan at open is the only thing that removes it, and it must not touch anyone else's.

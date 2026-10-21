@@ -78,9 +78,7 @@ bool valid_meta_chain(const ConversationCheckpoint& live, const std::vector<size
 
 } // namespace
 
-bool ConversationSpillCache::read_sidecar(const std::filesystem::path& meta, Entry& entry, bool& other_identity,
-                                          std::string& error) const {
-    other_identity = false;
+bool ConversationSpillCache::read_sidecar(const std::filesystem::path& meta, Entry& entry, std::string& error) const {
     std::error_code ec;
     const uint64_t file_bytes = std::filesystem::file_size(meta, ec);
     if (ec || file_bytes < 4 + 4 + 16 + 8) { error = "spill sidecar is missing or too short"; return false; }
@@ -94,7 +92,7 @@ bool ConversationSpillCache::read_sidecar(const std::filesystem::path& meta, Ent
         !r.u64(model) || !r.u64(config)) {
         error = "unknown spill sidecar magic or version"; return false;
     }
-    if (model != identity_.model || config != identity_.config) { other_identity = true; return false; }
+    if (model != identity_.model || config != identity_.config) { error = "sidecar names another fingerprint"; return false; }
     uint64_t cvec = 0;
     if (!r.u64(cvec) || cvec > 1) { error = "invalid cvec flag in sidecar"; return false; }
     entry.cvec = cvec != 0;
@@ -179,10 +177,17 @@ bool ConversationSpillCache::open(const std::filesystem::path& directory, Sessio
             Entry entry;
             entry.stem = meta;
             entry.stem.replace_extension();   // drop ".meta" -> the shared stem
-            bool other_identity = false;
             std::string parse_error;
-            if (!read_sidecar(meta, entry, other_identity, parse_error)) {
-                if (!other_identity) { std::filesystem::remove(meta, ec); ec.clear(); std::filesystem::remove(entry.session_path(), ec); ec.clear(); ++stale; }
+            // A sidecar this fingerprint cannot read - another fingerprint, a truncated file, a foreign magic - names
+            // a session file session_file_read refuses for the same reason, so nothing can ever restore it. Skipping
+            // only those pairs kept them out of the index and out of bytes_, which is what enforce_budget() bounds:
+            // the fingerprint carries STRATA_VERSION and the K/V settings, so a rebuild, --kv, --max-context or
+            // --kv-resident change turned every file in the directory into 13 GiB x N of snapshots no build can load,
+            // outside the limit, and they stayed until they buried the disk. They go with the sidecar that named them.
+            if (!read_sidecar(meta, entry, parse_error)) {
+                std::filesystem::remove(meta, ec); ec.clear();
+                std::filesystem::remove(entry.session_path(), ec); ec.clear();
+                ++stale;
                 continue;
             }
             std::error_code sec;

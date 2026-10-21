@@ -27,8 +27,12 @@ struct ConversationSpillMatch {
 
 class ConversationSpillCache {
 public:
-    // Opens (creating if needed) the spill directory and indexes the conversations already in it. Files whose
-    // sidecar names another model/config identity, or whose session file is missing or unreadable, are removed.
+    // Opens (creating if needed) the spill directory and indexes the conversations already in it. A sidecar naming
+    // another model/config fingerprint, one that cannot be read, or one whose session file is gone has BOTH files
+    // removed: session_file_read refuses a foreign fingerprint for good, so those bytes can never be restored, and
+    // they are the directory's bytes all the same - budget_bytes is the whole directory's limit, as the flag says.
+    // The fingerprint carries STRATA_VERSION and the K/V settings, so a rebuild, --kv, --max-context or
+    // --kv-resident changing clears the whole old tier here, before it fills the disk under the limit.
     bool open(const std::filesystem::path& directory, SessionFileIdentity identity, uint64_t budget_bytes,
               std::string& error);
     bool enabled() const { return enabled_; }
@@ -79,7 +83,7 @@ private:
         std::string meta_path() const { return (stem.string() + ".meta"); }
     };
     void enforce_budget();
-    bool read_sidecar(const std::filesystem::path& meta, Entry& entry, bool& other_identity, std::string& error) const;
+    bool read_sidecar(const std::filesystem::path& meta, Entry& entry, std::string& error) const;
     bool write_sidecar(const std::filesystem::path& meta, const Entry& entry, std::string& error) const;
 
     bool enabled_ = false;
